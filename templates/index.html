@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TB Screening — New Scan</title>
+<style>
+  :root {
+    --dark: #0D1B2A;
+    --blue: #1565C0;
+    --blue-light: #E3F0FC;
+    --grey: #607D8B;
+    --light: #F5F7FA;
+    --accent: #E53935;
+    --border: #CFD8DC;
+    --mono: 'IBM Plex Mono', 'Courier New', monospace;
+    --sans: 'Inter', -apple-system, system-ui, sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    font-family: var(--sans);
+    background: var(--light);
+    color: var(--dark);
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 32px 16px;
+  }
+
+  .card {
+    width: 100%;
+    max-width: 620px;
+    background: #fff;
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 4px 24px rgba(13,27,42,0.08);
+  }
+
+  .card-header {
+    background: var(--dark);
+    color: #fff;
+    padding: 28px 32px;
+  }
+  .card-header .eyebrow {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: #90CAF9;
+    margin: 0 0 6px;
+  }
+  .card-header h1 {
+    margin: 0;
+    font-size: 22px;
+    font-weight: 700;
+  }
+  .card-header p {
+    margin: 6px 0 0;
+    font-size: 13px;
+    color: #B0C4D8;
+  }
+
+  form { padding: 28px 32px 32px; }
+
+  .section-label {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--blue);
+    font-weight: 700;
+    margin: 0 0 12px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--border);
+  }
+  .section-label:not(:first-child) { margin-top: 24px; }
+
+  .row { display: flex; gap: 14px; }
+  .row > .field { flex: 1; }
+
+  .field { margin-bottom: 14px; }
+  .field label {
+    display: block;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--grey);
+    margin-bottom: 5px;
+  }
+  .field input,
+  .field select,
+  .field textarea {
+    width: 100%;
+    padding: 10px 12px;
+    font-size: 14px;
+    font-family: var(--sans);
+    color: var(--dark);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: #fff;
+    transition: border-color 0.15s, box-shadow 0.15s;
+  }
+  .field input:focus,
+  .field select:focus,
+  .field textarea:focus {
+    outline: none;
+    border-color: var(--blue);
+    box-shadow: 0 0 0 3px var(--blue-light);
+  }
+  .field textarea { resize: vertical; min-height: 60px; }
+
+  /* File upload */
+  .upload {
+    border: 1.5px dashed var(--border);
+    border-radius: 8px;
+    padding: 24px;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+    background: var(--light);
+  }
+  .upload:hover { border-color: var(--blue); background: var(--blue-light); }
+  .upload input[type=file] { display: none; }
+  .upload .upload-icon {
+    width: 36px; height: 36px; margin: 0 auto 10px;
+    display: block;
+  }
+  .upload .upload-text {
+    font-size: 13px;
+    color: var(--grey);
+  }
+  .upload .upload-text b { color: var(--blue); }
+  .upload .file-name {
+    margin-top: 8px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--dark);
+    word-break: break-all;
+  }
+
+  /* Errors */
+  .errors {
+    background: #FFF8E1;
+    border: 1px solid #FFB300;
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin-bottom: 18px;
+    font-size: 13px;
+  }
+  .errors ul { margin: 4px 0 0; padding-left: 18px; }
+
+  /* Submit */
+  .submit-row { margin-top: 24px; }
+  button[type=submit] {
+    width: 100%;
+    padding: 13px 20px;
+    font-size: 14px;
+    font-weight: 700;
+    font-family: var(--mono);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: #fff;
+    background: var(--blue);
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+  button[type=submit]:hover { background: #0d4d9e; }
+  button[type=submit]:disabled { background: var(--grey); cursor: wait; }
+
+  .hint {
+    margin-top: 10px;
+    font-size: 11.5px;
+    color: var(--grey);
+    text-align: center;
+    line-height: 1.6;
+  }
+</style>
+</head>
+<body>
+
+<div class="card">
+  <div class="card-header">
+    <p class="eyebrow">AI-Assisted Screening</p>
+    <h1>New Chest X-Ray Scan</h1>
+    <p>Enter patient details and upload a chest X-ray to run TB screening, lung segmentation, and generate a report.</p>
+  </div>
+
+  <form action="/predict" method="POST" enctype="multipart/form-data" id="scanForm">
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        <div class="errors">
+          <strong>Please fix the following:</strong>
+          <ul>
+            {% for category, message in messages %}
+              <li>{{ message }}</li>
+            {% endfor %}
+          </ul>
+        </div>
+      {% endif %}
+    {% endwith %}
+
+    <p class="section-label">Patient Information</p>
+
+    <div class="row">
+      <div class="field">
+        <label for="patient_name">Full Name</label>
+        <input type="text" id="patient_name" name="patient_name" placeholder="e.g. Ramesh Kumar" required>
+      </div>
+      <div class="field">
+        <label for="patient_id">Patient ID</label>
+        <input type="text" id="patient_id" name="patient_id" placeholder="e.g. TB-014" required>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="field">
+        <label for="gender">Gender</label>
+        <select id="gender" name="gender" required>
+          <option value="" disabled selected>Select</option>
+          <option value="Male">Male</option>
+          <option value="Female">Female</option>
+          <option value="Other">Other</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="age">Age</label>
+        <input type="number" id="age" name="age" min="0" max="130" placeholder="e.g. 42" required>
+      </div>
+    </div>
+
+    <div class="field">
+      <label for="referred_by">Referred By <span style="font-weight:400;">(optional)</span></label>
+      <input type="text" id="referred_by" name="referred_by" placeholder="e.g. Dr. Sharma / Self">
+    </div>
+
+    <div class="field">
+      <label for="notes">Clinical Notes <span style="font-weight:400;">(optional)</span></label>
+      <textarea id="notes" name="notes" placeholder="Any relevant history or symptoms..."></textarea>
+    </div>
+
+    <p class="section-label">Chest X-Ray</p>
+
+    <div class="field">
+      <label class="upload" for="xray" id="uploadLabel">
+        <svg class="upload-icon" viewBox="0 0 24 24" fill="none" stroke="#1565C0" stroke-width="1.5">
+          <path d="M12 16V4M12 4l-4 4M12 4l4 4" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <div class="upload-text"><b>Click to upload</b> a chest X-ray (PNG, JPG, BMP)</div>
+        <div class="file-name" id="fileName"></div>
+        <input type="file" id="xray" name="xray" accept=".png,.jpg,.jpeg,.bmp" required>
+      </label>
+    </div>
+
+    <div class="submit-row">
+      <button type="submit" id="submitBtn">Run Screening</button>
+      <p class="hint">
+        Runs DenseNet121 classification, lung segmentation, and GradCAM++ heatmap generation.<br>
+        This may take a few seconds.
+      </p>
+    </div>
+
+  </form>
+</div>
+
+<script>
+  const fileInput = document.getElementById('xray');
+  const fileName = document.getElementById('fileName');
+  const form = document.getElementById('scanForm');
+  const submitBtn = document.getElementById('submitBtn');
+
+  fileInput.addEventListener('change', () => {
+    fileName.textContent = fileInput.files.length
+      ? fileInput.files[0].name
+      : '';
+  });
+
+  form.addEventListener('submit', () => {
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Processing…';
+  });
+</script>
+
+</body>
+</html>

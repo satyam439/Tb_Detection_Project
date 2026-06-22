@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TB Screening — Result for {{ patient.name }}</title>
+<style>
+  :root {
+    --dark: #0D1B2A;
+    --blue: #1565C0;
+    --blue-light: #E3F0FC;
+    --grey: #607D8B;
+    --light: #F5F7FA;
+    --accent: #E53935;
+    --orange: #FB8C00;
+    --green: #2E7D32;
+    --border: #CFD8DC;
+    --mono: 'IBM Plex Mono', 'Courier New', monospace;
+    --sans: 'Inter', -apple-system, system-ui, sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    font-family: var(--sans);
+    background: var(--light);
+    color: var(--dark);
+    min-height: 100vh;
+    padding: 32px 16px;
+  }
+
+  .wrap { max-width: 760px; margin: 0 auto; }
+
+  .card {
+    background: #fff;
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 4px 24px rgba(13,27,42,0.08);
+    margin-bottom: 20px;
+  }
+
+  .card-header {
+    background: var(--dark);
+    color: #fff;
+    padding: 24px 32px;
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 16px;
+  }
+  .card-header .eyebrow {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: #90CAF9;
+    margin: 0 0 6px;
+  }
+  .card-header h1 { margin: 0; font-size: 20px; font-weight: 700; }
+  .card-header .meta {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: #B0C4D8;
+    text-align: right;
+    line-height: 1.7;
+  }
+
+  .body { padding: 24px 32px 28px; }
+
+  /* Risk badge */
+  .risk-badge {
+    display: inline-block;
+    padding: 6px 16px;
+    border-radius: 4px;
+    font-family: var(--mono);
+    font-weight: 700;
+    font-size: 13px;
+    letter-spacing: 0.06em;
+    color: #fff;
+    margin-bottom: 18px;
+  }
+  .risk-HIGH { background: var(--accent); }
+  .risk-MODERATE { background: var(--orange); }
+  .risk-LOW { background: var(--green); }
+
+  .section-label {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--blue);
+    font-weight: 700;
+    margin: 0 0 10px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--border);
+  }
+  .section-label:not(:first-child) { margin-top: 22px; }
+
+  table.info { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.info td {
+    padding: 7px 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  table.info td.label { color: var(--grey); width: 40%; }
+  table.info td.value { font-weight: 600; }
+  table.info tr:last-child td { border-bottom: none; }
+
+  .heatmap-wrap { text-align: center; margin-top: 6px; }
+  .heatmap-wrap img {
+    max-width: 100%;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+  }
+  .heatmap-caption {
+    font-size: 11.5px;
+    color: var(--grey);
+    margin-top: 8px;
+    font-style: italic;
+  }
+
+  .actions {
+    display: flex;
+    gap: 10px;
+    margin-top: 20px;
+    flex-wrap: wrap;
+  }
+  .btn {
+    flex: 1;
+    min-width: 160px;
+    text-align: center;
+    padding: 12px 18px;
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    text-decoration: none;
+    border-radius: 6px;
+    transition: opacity 0.15s;
+  }
+  .btn:hover { opacity: 0.85; }
+  .btn-primary { background: var(--blue); color: #fff; }
+  .btn-secondary { background: var(--dark); color: #fff; }
+  .btn-outline {
+    background: #fff;
+    color: var(--blue);
+    border: 1px solid var(--blue);
+  }
+
+  .disclaimer {
+    background: #FFF8E1;
+    border: 1px solid #FFB300;
+    border-radius: 8px;
+    padding: 12px 16px;
+    font-size: 12px;
+    line-height: 1.6;
+    color: var(--dark);
+    margin-top: 20px;
+  }
+  .disclaimer b { display: block; margin-bottom: 4px; }
+
+  .back-link {
+    display: inline-block;
+    margin-top: 4px;
+    font-size: 13px;
+    color: var(--blue);
+    text-decoration: none;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="card">
+    <div class="card-header">
+      <div>
+        <p class="eyebrow">Screening Result</p>
+        <h1>{{ pred_label }} — {{ pred_confidence }}% confidence</h1>
+      </div>
+      <div class="meta">
+        Patient: {{ patient.name }}<br>
+        ID: {{ patient.patient_id }}<br>
+        System: DenseNet121 + GradCAM++
+      </div>
+    </div>
+
+    <div class="body">
+      <span class="risk-badge risk-{{ risk_level }}">RISK LEVEL: {{ risk_level }}</span>
+
+      <p class="section-label">Patient Information</p>
+      <table class="info">
+        <tr><td class="label">Name</td><td class="value">{{ patient.name }}</td></tr>
+        <tr><td class="label">Patient ID</td><td class="value">{{ patient.patient_id }}</td></tr>
+        <tr><td class="label">Gender</td><td class="value">{{ patient.gender }}</td></tr>
+        <tr><td class="label">Age</td><td class="value">{{ patient.age }}</td></tr>
+        <tr><td class="label">Referred By</td><td class="value">{{ patient.referred_by }}</td></tr>
+        {% if patient.notes and patient.notes != "N/A" %}
+        <tr><td class="label">Clinical Notes</td><td class="value">{{ patient.notes }}</td></tr>
+        {% endif %}
+      </table>
+
+      <p class="section-label">Diagnosis Results</p>
+      <table class="info">
+        <tr><td class="label">Prediction</td><td class="value">{{ pred_label }}</td></tr>
+        <tr><td class="label">Confidence (TB)</td><td class="value">{{ confidence_tb }}%</td></tr>
+        <tr><td class="label">Confidence (Healthy)</td><td class="value">{{ confidence_healthy }}%</td></tr>
+        <tr><td class="label">Lung Field Coverage</td><td class="value">{{ lung_coverage_pct }}% of frame</td></tr>
+        <tr><td class="label">Risk Level</td><td class="value">{{ risk_level }}</td></tr>
+      </table>
+
+      <p class="section-label">X-Ray Heatmap (GradCAM++, Lung-Masked)</p>
+      <div class="heatmap-wrap">
+        <img src="/outputs/{{ heatmap_filename }}" alt="GradCAM heatmap overlay">
+        <p class="heatmap-caption">Warmer colors indicate regions the model weighted more heavily for the predicted class, restricted to the segmented lung field.</p>
+      </div>
+
+      <div class="actions">
+        <button class="btn btn-primary" id="open3dBtn" type="button">Open 3D Desktop Viewer</button>
+        <a class="btn btn-secondary" href="/outputs/{{ report_filename }}" target="_blank">Download PDF Report</a>
+        <a class="btn btn-outline" href="/">New Scan</a>
+      </div>
+      <p id="viewerStatus" style="font-size:11.5px;color:var(--grey);margin-top:8px;display:none;"></p>
+
+      <div class="disclaimer">
+        <b>CLINICAL DISCLAIMER</b>
+        This report is generated by an AI-assisted screening tool and is intended to support, not replace, the judgment of a qualified medical professional. A confirmed TB diagnosis requires microbiological testing, clinical examination, and radiologist review.
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+  const open3dBtn = document.getElementById('open3dBtn');
+  const viewerStatus = document.getElementById('viewerStatus');
+
+  open3dBtn.addEventListener('click', async () => {
+    open3dBtn.disabled = true;
+    open3dBtn.textContent = 'Opening…';
+    viewerStatus.style.display = 'block';
+    viewerStatus.textContent = 'Launching the 3D viewer window — this opens as a separate desktop window, not in your browser.';
+
+    try {
+      const res = await fetch('/open-3d-viewer', { method: 'POST' });
+      const data = await res.json();
+      if (data.ok) {
+        viewerStatus.textContent = '3D viewer window opened. Check your dock/taskbar if you don\'t see it.';
+      } else {
+        viewerStatus.textContent = 'Could not open the 3D viewer: ' + (data.error || 'unknown error');
+        viewerStatus.style.color = '#E53935';
+      }
+    } catch (err) {
+      viewerStatus.textContent = 'Request failed: ' + err.message;
+      viewerStatus.style.color = '#E53935';
+    } finally {
+      open3dBtn.disabled = false;
+      open3dBtn.textContent = 'Open 3D Desktop Viewer';
+    }
+  });
+</script>
+
+</body>
+</html>

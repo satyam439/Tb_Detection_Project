@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+Shenzhen/
+dataset/
+batch_results/
+outputs/
+uploads/
+tb_output/

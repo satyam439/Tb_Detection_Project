@@ -1,0 +1,13 @@
+flask
+torch
+torchvision
+numpy
+opencv-python
+pillow
+matplotlib
+scipy
+pyvista
+vtk
+plotly
+pandas
+pytorch-grad-cam
