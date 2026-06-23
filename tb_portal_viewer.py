@@ -250,7 +250,7 @@ plotter.add_text(
     position="lower_left", font_size=9, color="#333333",
 )
 plotter.add_text(
-    "F=Front  B=Back  L=Left  R=Right  Y=Slow Rotation  Space=Stop",
+    "F=Front  B=Back  L=Left  R=Right  Y=Rotate  V=Create Video  Space=Stop",
     position=(20, 20), font_size=10, color="black",
 )
 
@@ -260,7 +260,6 @@ def front_view():
     """Standard PA (posterior-anterior) projection."""
     plotter.view_yz()           # look along Y axis
     plotter.reset_camera()
-    plotter.camera.zoom(2.8)
     plotter.render()
 
 def back_view():
@@ -292,16 +291,42 @@ def right_view():
 rotation_running = False
 
 def rotate_y_slow():
-    """180° azimuth rotation at a gentle pace."""
+    """
+    Full 360 degree clockwise rotation
+    Manager Demo
+    """
+
     global rotation_running
+
     rotation_running = True
-    for _ in range(360):
+
+    print("[INFO] Starting Y-axis rotation...")
+
+    front_view()
+
+    for angle in range(360):
+
         if not rotation_running:
             break
-        plotter.camera.Azimuth(-0.5)
+
+        plotter.camera.Azimuth(-1)
+
         plotter.render()
-        time.sleep(0.03)
+
+        time.sleep(0.05)
+
+        if angle == 90:
+            print("[INFO] 90° Side View")
+
+        elif angle == 180:
+            print("[INFO] 180° Back View")
+
+        elif angle == 270:
+            print("[INFO] 270° Opposite Side View")
+
     rotation_running = False
+
+    print("[INFO] 360° Rotation Complete")
 
 def stop_rotation():
     global rotation_running
