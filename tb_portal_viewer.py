@@ -1,36 +1,7 @@
-"""
-viewer_3d.py
-─────────────
-PyVista 3-D lung viewer.
-Loads pre-built STL meshes, maps the 2-D CAM hotspot onto the 3-D lung
-surface, and shows an interactive window with keyboard shortcuts.
-
-Directory layout expected
-─────────────────────────
-<project>/
-  lung_model/
-    left_lung_shell.stl   ← preferred (split output of split_lung_layers.py)
-    right_lung_shell.stl
-    left_lung_tree.stl    ← optional bronchi / vessel tree
-    right_lung_tree.stl
-    left_lung.stl         ← fallback raw meshes
-    right_lung.stl
-  outputs/
-    tb_center.npy         ← (cx, cy) in 224×224 image space; absent = healthy
-
-Keyboard shortcuts
-──────────────────
-  F  – front view (default PA projection)
-  B  – back view
-  L  – left lateral view
-  R  – right lateral view
-  Y  – slow 180° azimuth rotation
-  Space – stop rotation
-"""
-
 import os
 import sys
 import time
+import threading
 import numpy as np
 import pyvista as pv
 
@@ -46,6 +17,7 @@ LEFT_RAW    = os.path.join(BASE_DIR, "lung_model", "left_lung.stl")
 RIGHT_RAW   = os.path.join(BASE_DIR, "lung_model", "right_lung.stl")
 
 TB_CENTER_PATH = os.path.join(BASE_DIR, "outputs", "tb_center.npy")
+VIDEO_PATH     = os.path.join(BASE_DIR, "outputs", "lung_rotation.mp4")
 
 # ── DETECT SPLIT VS RAW MESHES ───────────────────────────────────────────────
 
@@ -107,6 +79,24 @@ if right_tree is not None: right_tree.translate([ GAP_MM, 0, 0], inplace=True)
 
 print("Left lung bounds :", [round(b, 1) for b in left_shell.bounds])
 print("Right lung bounds:", [round(b, 1) for b in right_shell.bounds])
+
+# ── SHARED ROTATION PIVOT  ───────────────────────────────────────────────────
+# All rotation is around a single world Y-axis passing through the combined
+# centroid so both lungs (and any markers) rotate as one rigid body.
+
+combined_for_pivot = left_shell.merge(right_shell)
+PIVOT = np.array(combined_for_pivot.center)   # (cx, cy, cz) world centroid
+print(f"[INFO] Rotation pivot (world centroid): {[round(v,1) for v in PIVOT]}")
+
+# ── COLLECT ALL ROTATING ACTORS INTO ONE LIST ─────────────────────────────────
+
+def get_rotating_meshes():
+    """Return the list of meshes that participate in Y-axis rotation."""
+    meshes = [left_shell, right_shell]
+    if left_tree  is not None: meshes.append(left_tree)
+    if right_tree is not None: meshes.append(right_tree)
+    return meshes
+
 
 # ── MAP 2-D HOTSPOT → 3-D POSITION ──────────────────────────────────────────
 
@@ -178,8 +168,7 @@ def add_zone_scalars(mesh):
 left_shell  = add_zone_scalars(left_shell)
 right_shell = add_zone_scalars(right_shell)
 
-ZONE_CMAP = ["#D7E4EA", "#D7E4EA"]   # uniform pale blue — change to e.g.
-                                      # ["#A8C8E0","#E8A8A0"] for upper/lower tint
+ZONE_CMAP = ["#D7E4EA", "#D7E4EA"]   # uniform pale blue
 
 # ── PLOTTER SETUP ────────────────────────────────────────────────────────────
 
@@ -221,8 +210,8 @@ plotter.show_bounds(
     ticks="outside",
     n_xlabels=5, n_ylabels=5, n_zlabels=5,
     xtitle="Right-Left (mm)",
-    ytitle="Anterior-Posterior (mm)",
-    ztitle="Superior-Inferior (mm)",
+    ytitle="Superior-Inferior (mm)",   # Y is vertical per spec
+    ztitle="Anterior-Posterior (mm)",  # Z is depth per spec
     font_size=10,
     color="black",
     bold=False,
@@ -255,83 +244,170 @@ plotter.add_text(
 )
 
 # ── CAMERA VIEWS ─────────────────────────────────────────────────────────────
+# Camera is FIXED; the meshes rotate around the world Y-axis.
+# Front view: camera sits along the -Z axis (anterior of patient faces viewer).
 
 def front_view():
-    """Standard PA (posterior-anterior) projection."""
-    plotter.view_yz()           # look along Y axis
-    plotter.reset_camera()
+    plotter.camera_position = [
+        (0, PIVOT[1], PIVOT[2] - 450),   # camera in front along -Z
+        tuple(PIVOT),                      # look at pivot
+        (0, 1, 0),                         # Y is up
+    ]
     plotter.render()
 
 def back_view():
     plotter.camera_position = [
-        (0,  450, 80),
-        (0,    0, 80),
-        (0,    0,  1),
+        (0, PIVOT[1], PIVOT[2] + 450),
+        tuple(PIVOT),
+        (0, 1, 0),
     ]
     plotter.render()
 
 def left_view():
     plotter.camera_position = [
-        (-450, 0, 80),
-        (   0, 0, 80),
-        (   0, 0,  1),
+        (PIVOT[0] - 450, PIVOT[1], PIVOT[2]),
+        tuple(PIVOT),
+        (0, 1, 0),
     ]
     plotter.render()
 
 def right_view():
     plotter.camera_position = [
-        (450, 0, 80),
-        (  0, 0, 80),
-        (  0, 0,  1),
+        (PIVOT[0] + 450, PIVOT[1], PIVOT[2]),
+        tuple(PIVOT),
+        (0, 1, 0),
     ]
     plotter.render()
 
 # ── ROTATION HELPERS ─────────────────────────────────────────────────────────
+#
+# Rotation strategy
+# ─────────────────
+# We rotate every mesh IN PLACE around the shared PIVOT using the world Y-axis
+# [0, 1, 0].  The camera stays at the front-view position so the viewer sees
+# the lungs spin — front → right-side (90°) → back (180°) → left-side (270°)
+# → front again (360°).
+#
+# PyVista's rotate_y(angle, point=...) applies a RIGHT-HAND rotation around
+# the Y-axis.  A positive angle rotates:
+#   +X → +Z  (i.e. the right side of the model swings toward the camera)
+# which is CLOCKWISE when viewed from above (–Y looking down) and matches
+# the "clockwise" requirement when the camera sits on the –Z axis looking in.
+#
+# We step 1° per frame at ~0.05 s/frame → ~18 seconds for a full revolution.
 
 rotation_running = False
 
+STEP_DEG   = 1          # degrees per frame
+FRAME_WAIT = 0.05       # seconds between frames  (~20 fps)
+
+
+def _all_rotating_actors():
+    """Yield every mesh that must rotate together."""
+    yield left_shell
+    yield right_shell
+    if left_tree  is not None: yield left_tree
+    if right_tree is not None: yield right_tree
+    if finding_dots is not None: yield finding_dots
+
+
+def _rotate_one_step(deg: float):
+    """Rotate all actors by *deg* degrees around the world Y-axis at PIVOT."""
+    for mesh in _all_rotating_actors():
+        mesh.rotate_y(deg, point=PIVOT, inplace=True)
+
+
 def rotate_y_slow():
     """
-    Full 360 degree clockwise rotation
-    Manager Demo
+    360° clockwise rotation around the vertical (Y) world axis.
+    Camera is FIXED at the front-view position.
+    Milestones are printed at 90 / 180 / 270 / 360°.
     """
-
     global rotation_running
 
+    if rotation_running:
+        print("[INFO] Rotation already running — press Space to stop first.")
+        return
+
     rotation_running = True
+    front_view()          # ensure camera is at the canonical front position
+    print("[INFO] Starting 360° Y-axis rotation (clockwise from front) …")
 
-    print("[INFO] Starting Y-axis rotation...")
+    total_angle = 0.0
 
-    front_view()
-
-    for angle in range(360):
-
-        if not rotation_running:
-            break
-
-        plotter.camera.Azimuth(-1)
-
+    while total_angle < 360.0 and rotation_running:
+        _rotate_one_step(STEP_DEG)
+        total_angle += STEP_DEG
         plotter.render()
+        time.sleep(FRAME_WAIT)
 
-        time.sleep(0.05)
+        # ── milestone logging ──
+        angle_int = int(round(total_angle))
+        if angle_int == 90:
+            print("[INFO]  90° — RIGHT LATERAL VIEW")
+        elif angle_int == 180:
+            print("[INFO] 180° — BACK VIEW (posterior facing viewer)")
+        elif angle_int == 270:
+            print("[INFO] 270° — LEFT LATERAL VIEW")
+        elif angle_int == 360:
+            print("[INFO] 360° — FRONT VIEW RESTORED")
 
-        if angle == 90:
-            print("[INFO] 90° Side View")
+    # If stopped early, bring back to front view
+    if not rotation_running:
+        print("[INFO] Rotation cancelled by user.")
+    else:
+        rotation_running = False
+        print("[INFO] Full 360° rotation complete.")
 
-        elif angle == 180:
-            print("[INFO] 180° Back View")
-
-        elif angle == 270:
-            print("[INFO] 270° Opposite Side View")
-
-    rotation_running = False
-
-    print("[INFO] 360° Rotation Complete")
 
 def stop_rotation():
     global rotation_running
     rotation_running = False
     print("[INFO] Rotation stopped.")
+
+
+# ── VIDEO EXPORT ──────────────────────────────────────────────────────────────
+
+def record_rotation_video():
+    """
+    Capture one full 360° rotation to VIDEO_PATH (MP4).
+    The camera is fixed at the front view; the meshes rotate.
+    Each degree-step is written as one frame.
+    """
+    global rotation_running
+
+    if rotation_running:
+        print("[INFO] Already rotating — stop first (Space) before recording.")
+        return
+
+    os.makedirs(os.path.dirname(VIDEO_PATH), exist_ok=True)
+
+    print(f"[INFO] Recording 360° rotation to {VIDEO_PATH} …")
+    rotation_running = True
+    front_view()
+
+    # Open the movie writer (requires ffmpeg on PATH)
+    plotter.open_movie(VIDEO_PATH, framerate=20)
+
+    total_angle = 0.0
+    while total_angle < 360.0 and rotation_running:
+        _rotate_one_step(STEP_DEG)
+        total_angle += STEP_DEG
+        plotter.render()
+        plotter.write_frame()
+
+        angle_int = int(round(total_angle))
+        if angle_int in (90, 180, 270, 360):
+            print(f"[INFO] {angle_int:3d}° frame captured")
+
+    plotter.close_movie()
+    rotation_running = False
+
+    if total_angle >= 360.0:
+        print(f"[INFO] Video saved → {VIDEO_PATH}")
+    else:
+        print("[INFO] Recording cancelled; partial video may exist.")
+
 
 # ── KEY BINDINGS ──────────────────────────────────────────────────────────────
 
@@ -340,6 +416,7 @@ plotter.add_key_event("b",     back_view)
 plotter.add_key_event("l",     left_view)
 plotter.add_key_event("r",     right_view)
 plotter.add_key_event("y",     rotate_y_slow)
+plotter.add_key_event("v",     record_rotation_video)
 plotter.add_key_event("space", stop_rotation)
 
 # ── LAUNCH ────────────────────────────────────────────────────────────────────
