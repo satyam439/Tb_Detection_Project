@@ -47,8 +47,8 @@ else:
 # ── LOAD MESHES ──────────────────────────────────────────────────────────────
 
 if USE_SPLIT:
-    left_shell  = pv.read(LEFT_SHELL).smooth(n_iter=50, relaxation_factor=0.1)
-    right_shell = pv.read(RIGHT_SHELL).smooth(n_iter=50, relaxation_factor=0.1)
+    left_shell  = pv.read(LEFT_SHELL).smooth(n_iter=10, relaxation_factor=0.05)
+    right_shell = pv.read(RIGHT_SHELL).smooth(n_iter=10, relaxation_factor=0.05)
     left_tree   = pv.read(LEFT_TREE)  if os.path.exists(LEFT_TREE)  else None
     right_tree  = pv.read(RIGHT_TREE) if os.path.exists(RIGHT_TREE) else None
 else:
