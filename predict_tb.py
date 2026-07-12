@@ -452,6 +452,10 @@ def run_pipeline(image_path, patient_name, patient_id, gender, age,
     grayscale_cam_raw = compute_gradcam(model, input_tensor, target_class=pred_idx)
     grayscale_cam = apply_lung_mask_to_cam(grayscale_cam_raw, lung_mask)
 
+    # ── SAVE REAL GRADCAM.NPY so viewer_3d.py uses actual heatmap ──
+    np.save(os.path.join(OUTPUT_DIR, "gradcam.npy"), grayscale_cam.astype(np.float32))
+    print(f"[INFO] gradcam.npy saved — peak at {np.unravel_index(grayscale_cam.argmax(), grayscale_cam.shape)}")
+
        # ------------------------------------------------
     # TB hotspot handling
     # ------------------------------------------------
