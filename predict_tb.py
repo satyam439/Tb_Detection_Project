@@ -22,10 +22,8 @@ from reportlab.platypus import (
     TableStyle, Image as RLImage, HRFlowable
 )
 
-from lung_segmentation import (
-    load_lung_unet, segment_lungs, split_left_right_lung,
-    apply_lung_mask_to_cam
-)
+from lung_mask_xrv import generate_lung_masks
+from lung_segmentation import apply_lung_mask_to_cam, get_lobe_masks
 from export_3d_viewer import export_3d_viewer
 
 # ============================================================
@@ -51,7 +49,6 @@ OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 MODEL_PATH = os.path.join(BASE_DIR, "tb_model.pth")
-UNET_PATH = os.path.join(BASE_DIR, "lung_unet.pth")
 
 # ============================================================
 # DEVICE
@@ -77,8 +74,9 @@ print(f"[INFO] Using device: {device}")
 model = load_model(MODEL_PATH)
 print(f"[INFO] TB model loaded from: {MODEL_PATH}")
 
-lung_unet = load_lung_unet(UNET_PATH, device)
-print(f"[INFO] Lung segmentation U-Net loaded from: {UNET_PATH}")
+# NOTE: lung segmentation now uses lung_mask_xrv.py (pretrained
+# torchxrayvision PSPNet), which loads its own weights lazily on first
+# call — no separate U-Net loading needed here anymore.
 
 # ============================================================
 # TRANSFORM
@@ -103,6 +101,14 @@ def compute_gradcam(model, input_tensor, target_class):
     GradCAM++ on the LAST dense layer before pooling (features.norm5),
     which gives a 7x7 activation map upsampled smoothly to 224x224.
 
+    NOTE: a two-layer fusion (denseblock3 + norm5) was tried and reverted.
+    Averaging in the mid-level denseblock3 layer diluted the sharp peak
+    from the final layer, producing a flat, washed-out heatmap with barely
+    any visible red — worse for readability than the original single-layer
+    version, even though the underlying activation math was "more
+    sophisticated". Back to single-layer, which reliably shows a clear,
+    strong hotspot.
+
     The CAM is generated for the PREDICTED class (target_class), so the
     heatmap reflects what the model actually based its decision on,
     rather than always highlighting "TB-like" regions on healthy scans.
@@ -120,7 +126,6 @@ def compute_gradcam(model, input_tensor, target_class):
     grayscale = cv2.resize(
         grayscale, (224, 224), interpolation=cv2.INTER_CUBIC
     )
-
     grayscale = np.clip(grayscale, 0, None)
     g_min, g_max = grayscale.min(), grayscale.max()
     grayscale = (grayscale - g_min) / (g_max - g_min + 1e-8)
@@ -138,7 +143,17 @@ def build_heatmap_overlay(original_rgb, grayscale_cam, pred_label,
         np.uint8(grayscale_cam * 255), cv2.COLORMAP_JET
     )
     base_bgr = cv2.cvtColor(original_rgb, cv2.COLOR_RGB2BGR)
-    blend_bgr = cv2.addWeighted(base_bgr, 0.55, heatmap_bgr, 0.45, 0)
+
+    # For a Healthy prediction, the CAM shows "where the model found support
+    # for Healthy" — NOT a danger zone. Because the heatmap is min-max
+    # normalized, it will always show red somewhere even when raw activation
+    # is low and flat, which looks alarming/misleading on a negative result.
+    # So for Healthy, blend it in very lightly instead of using the same
+    # high-intensity overlay as a TB-positive result.
+    if pred_label == "Healthy":
+        blend_bgr = cv2.addWeighted(base_bgr, 0.92, heatmap_bgr, 0.08, 0)
+    else:
+        blend_bgr = cv2.addWeighted(base_bgr, 0.55, heatmap_bgr, 0.45, 0)
 
     tag = f"{pred_label} | {pred_confidence}% | Risk: {risk_level}"
     bar_h = 22
@@ -147,7 +162,88 @@ def build_heatmap_overlay(original_rgb, grayscale_cam, pred_label,
                 risk_color_cv, 1, cv2.LINE_AA)
     blend_bgr = np.vstack([bar, blend_bgr])
 
+    # ---- Anatomical R/L side markers (standard PA chest X-ray convention) ----
+    # On a PA film, the film is viewed as if facing the patient, so the
+    # patient's RIGHT lung appears on the LEFT side of the image, and the
+    # patient's LEFT lung appears on the RIGHT side of the image. This is
+    # a fixed anatomical convention, independent of the model's prediction
+    # — it just labels the image the way a doctor expects any chest X-ray
+    # to be labeled, so they can orient themselves immediately.
+    img_h, img_w = blend_bgr.shape[:2]
+    label_y = 40  # just below the top prediction bar
+    cv2.putText(blend_bgr, "R", (10, label_y), cv2.FONT_HERSHEY_DUPLEX, 0.9,
+                (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(blend_bgr, "L", (img_w - 30, label_y), cv2.FONT_HERSHEY_DUPLEX, 0.9,
+                (255, 255, 255), 2, cv2.LINE_AA)
+
     return blend_bgr
+
+
+# ============================================================
+# NEW: LOBE-WISE RISK SCORING
+# ============================================================
+
+def compute_lobe_risk(grayscale_cam_masked: np.ndarray,
+                       left_lung_mask: np.ndarray,
+                       right_lung_mask: np.ndarray) -> dict:
+    """
+    Breaks the (already lung-field-masked) GradCAM++ activation down
+    into a percentage share per lobe, instead of one blurry whole-lung
+    heatmap. This directly addresses activation that leaks onto ribs /
+    pleura by (a) already being restricted to the lung field via
+    apply_lung_mask_to_cam, and (b) here, normalizing so the report can
+    say "62% of activation is in the Right Upper Lobe" rather than just
+    showing a diffuse color wash.
+
+    Method: mean CAM activation *within* each lobe's own mask, then
+    normalized across all 5 lobes so shares sum to ~100%.
+
+    Args:
+        grayscale_cam_masked : HxW float32 [0,1], lung-masked CAM
+        left_lung_mask        : HxW uint8 (0/255), one lung only
+        right_lung_mask       : HxW uint8 (0/255), one lung only
+
+    Returns:
+        dict lobe_name -> percentage share (float, sums to ~100 if any
+        activation exists; all-zero dict if there's no activation at
+        all, e.g. a confidently Healthy scan).
+    """
+    lobe_masks = {}
+    lobe_masks.update(get_lobe_masks(right_lung_mask, side="right"))
+    lobe_masks.update(get_lobe_masks(left_lung_mask,  side="left"))
+
+    raw_scores = {}
+    for lobe_name, mask in lobe_masks.items():
+        mask_bool = mask > 0
+        if not mask_bool.any():
+            raw_scores[lobe_name] = 0.0
+            continue
+        raw_scores[lobe_name] = float(grayscale_cam_masked[mask_bool].mean())
+
+    total = sum(raw_scores.values())
+    if total <= 1e-9:
+        return {name: 0.0 for name in raw_scores}
+
+    return {
+        name: round(score / total * 100, 1)
+        for name, score in raw_scores.items()
+    }
+
+
+def _lobe_risk_tier(pct: float) -> str:
+    if pct >= 50:
+        return "HIGH"
+    if pct >= 20:
+        return "MODERATE"
+    if pct > 0:
+        return "LOW"
+    return "—"
+
+
+LOBE_ORDER = [
+    "RIGHT UPPER LOBE", "RIGHT MIDDLE LOBE", "RIGHT LOWER LOBE",
+    "LEFT UPPER LOBE", "LEFT LOWER LOBE",
+]
 
 # ============================================================
 # PDF HELPERS
@@ -190,13 +286,14 @@ RISK_COLOR_MAP = {"HIGH": C_ACCENT, "MODERATE": C_ORANGE, "LOW": C_GREEN}
 
 def build_pdf_report(patient: Patient, pred_label, pred_confidence,
                       confidence_tb, confidence_healthy, risk_level,
-                      heatmap_path):
+                      heatmap_path, lobe_risk_pct=None):
     report_path = os.path.join(
         OUTPUT_DIR,
         f"tb_report_{patient.patient_id.replace('/', '-')}.pdf"
     )
 
     risk_rl_color = RISK_COLOR_MAP[risk_level]
+    lobe_risk_pct = lobe_risk_pct or {}
 
     doc = SimpleDocTemplate(
         report_path,
@@ -332,6 +429,51 @@ def build_pdf_report(patient: Patient, pred_label, pred_confidence,
     story.append(diag_tbl)
     story.append(Spacer(1, 12))
 
+    # ---- NEW: Lobe-Wise Risk Distribution ----
+    story.append(Paragraph("Lobe-Wise Risk Distribution", h2_s))
+    story.append(HRFlowable(width=CW, thickness=1, color=C_BLUE, spaceAfter=6))
+
+    if pred_label == "TB" and any(v > 0 for v in lobe_risk_pct.values()):
+        lobe_data = [["Lobe", "Relative Share (not confidence)", "Tier"]]
+        for lobe_name in LOBE_ORDER:
+            pct = lobe_risk_pct.get(lobe_name, 0.0)
+            lobe_data.append([lobe_name.title(), f"{pct}%", _lobe_risk_tier(pct)])
+
+        lobe_tbl = Table(lobe_data, colWidths=[CW * 0.45, CW * 0.30, CW * 0.25])
+        lobe_tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), C_DARK),
+            ("TEXTCOLOR", (0, 0), (-1, 0), C_WHITE),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 9),
+            ("FONTNAME", (0, 1), (0, -1), "Helvetica-Bold"),
+            ("TEXTCOLOR", (0, 1), (0, -1), C_DARK),
+            ("TEXTCOLOR", (1, 1), (1, -1), C_BLUE),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [C_WHITE, C_LIGHT]),
+            ("TOPPADDING", (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ("LEFTPADDING", (0, 0), (-1, -1), 8),
+            ("GRID", (0, 0), (-1, -1), 0.4, hex_color("#CFD8DC")),
+        ]))
+        story.append(lobe_tbl)
+        story.append(Spacer(1, 4))
+        story.append(Paragraph(
+            "<i>NOTE: this is a RELATIVE spatial distribution, not a second "
+            "confidence score — the 5 shares always sum to ~100% regardless "
+            "of the overall prediction confidence above. It shows WHERE "
+            "within the lungs the model's activation is concentrated, not "
+            "HOW confident the model is that TB is present (see Confidence "
+            "(TB) above for that). Share = mean GradCAM++ activation, after "
+            "lung-field masking, inside each lobe, normalized across all 5 "
+            "lobes. Tiers: HIGH &ge;50%, MODERATE 20&ndash;49%, LOW &lt;20%. "
+            "Lobe boundaries are approximated by vertical position within "
+            "each lung, not traced fissure anatomy.</i>", small_s))
+    else:
+        story.append(Paragraph(
+            "<i>No significant lung-field activation to distribute across "
+            "lobes (Healthy prediction).</i>", small_s))
+
+    story.append(Spacer(1, 12))
+
     # ---- Heatmap image ----
     story.append(Paragraph("X-Ray Heatmap (GradCAM++)", h2_s))
     story.append(HRFlowable(width=CW, thickness=1, color=C_BLUE, spaceAfter=6))
@@ -343,7 +485,8 @@ def build_pdf_report(patient: Patient, pred_label, pred_confidence,
         img_data = [
             [RLImage(heatmap_path, width=img_w, height=img_h)],
             [Paragraph("<i>Warmer colors indicate regions the model "
-                       "weighted more heavily for the predicted class.</i>", small_s)],
+                       "weighted more heavily for the predicted class, "
+                       "restricted to the segmented lung field.</i>", small_s)],
         ]
         img_tbl = Table(img_data, colWidths=[img_w])
         img_tbl.setStyle(TableStyle([
@@ -402,7 +545,7 @@ def build_pdf_report(patient: Patient, pred_label, pred_confidence,
 
 def run_pipeline(image_path, patient_name, patient_id, gender, age,
                   referred_by="", notes="N/A"):
-  
+
     patient = Patient(
         name=patient_name,
         patient_id=patient_id,
@@ -441,22 +584,30 @@ def run_pipeline(image_path, patient_name, patient_id, gender, age,
     original = np.array(pil_img.resize((224, 224)))
     original_rgb = np.stack([original] * 3, axis=-1)
 
-    # ---- Lung segmentation ----
-    lung_mask, lung_prob = segment_lungs(
-        lung_unet, pil_img, device, target_size=(224, 224)
+    # ---- Lung segmentation (pretrained torchxrayvision PSPNet) ----
+    # Single model pass returns the union mask AND the left/right split
+    # together, so we don't run the segmenter twice.
+    lung_mask, left_lung_mask, right_lung_mask = generate_lung_masks(
+        pil_img, target_size=(224, 224)
     )
-    left_lung_mask, right_lung_mask = split_left_right_lung(lung_mask)
     lung_coverage_pct = int(np.count_nonzero(lung_mask) / lung_mask.size * 100)
 
     # ---- GradCAM, masked to lung field ----
     grayscale_cam_raw = compute_gradcam(model, input_tensor, target_class=pred_idx)
     grayscale_cam = apply_lung_mask_to_cam(grayscale_cam_raw, lung_mask)
 
+    # ---- NEW: lobe-wise risk breakdown (masked CAM, split by lobe) ----
+    lobe_risk_pct = compute_lobe_risk(grayscale_cam, left_lung_mask, right_lung_mask)
+    if pred_label == "TB":
+        top_lobe = max(lobe_risk_pct, key=lobe_risk_pct.get) if lobe_risk_pct else "N/A"
+        print(f"[INFO] Lobe risk breakdown: {lobe_risk_pct}")
+        print(f"[INFO] Highest-risk lobe: {top_lobe} ({lobe_risk_pct.get(top_lobe, 0)}%)")
+
     # ── SAVE REAL GRADCAM.NPY so viewer_3d.py uses actual heatmap ──
     np.save(os.path.join(OUTPUT_DIR, "gradcam.npy"), grayscale_cam.astype(np.float32))
     print(f"[INFO] gradcam.npy saved — peak at {np.unravel_index(grayscale_cam.argmax(), grayscale_cam.shape)}")
 
-       # ------------------------------------------------
+    # ------------------------------------------------
     # TB hotspot handling
     # ------------------------------------------------
 
@@ -475,10 +626,16 @@ def run_pipeline(image_path, patient_name, patient_id, gender, age,
             OUTPUT_DIR,
             "tb_center.npy"
         )
+        tb_centers_file = os.path.join(
+            OUTPUT_DIR,
+            "tb_centers.npy"
+        )
 
         if os.path.exists(tb_center_file):
-
             os.remove(tb_center_file)
+
+        if os.path.exists(tb_centers_file):
+            os.remove(tb_centers_file)
 
     heatmap_overlay = build_heatmap_overlay(
         original_rgb, grayscale_cam, pred_label, pred_confidence,
@@ -514,6 +671,7 @@ def run_pipeline(image_path, patient_name, patient_id, gender, age,
         confidence_healthy=confidence_healthy,
         risk_level=risk_level,
         heatmap_path=heatmap_path,
+        lobe_risk_pct=lobe_risk_pct,
     )
 
     return {
@@ -524,8 +682,43 @@ def run_pipeline(image_path, patient_name, patient_id, gender, age,
         "confidence_healthy": confidence_healthy,
         "risk_level": risk_level,
         "lung_coverage_pct": lung_coverage_pct,
+        "lobe_risk_pct": lobe_risk_pct,
         "heatmap_path": heatmap_path,
         "lung_mask_path": lung_mask_path,
         "viewer_path": viewer_path,
         "report_path": report_path,
     }
+
+# ============================================================
+# CLI ENTRY POINT
+# ============================================================
+# Without this block, running `python3 predict_tb.py <image_path>` only
+# loads the model and exits — run_pipeline() is never actually called, so
+# the image path is silently ignored and any leftover outputs/tb_center.npy
+# from a previous run gets reused by batch_test.py. This is what caused the
+# "every image comes back TB" bug both times it's shown up.
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) < 2:
+        print("Usage: python3 predict_tb.py <image_path> [patient_name] [patient_id] [gender] [age]")
+        sys.exit(1)
+
+    image_path = sys.argv[1]
+    patient_name = sys.argv[2] if len(sys.argv) > 2 else "Unknown"
+    patient_id = sys.argv[3] if len(sys.argv) > 3 else "N/A"
+    gender = sys.argv[4] if len(sys.argv) > 4 else "N/A"
+    age = sys.argv[5] if len(sys.argv) > 5 else 0
+
+    result = run_pipeline(
+        image_path=image_path,
+        patient_name=patient_name,
+        patient_id=patient_id,
+        gender=gender,
+        age=age,
+    )
+
+    print(f"[RESULT] {os.path.basename(image_path)} → "
+          f"{result['pred_label']} "
+          f"(TB={result['confidence_tb']}%, Healthy={result['confidence_healthy']}%)")

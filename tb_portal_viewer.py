@@ -1,9 +1,9 @@
 import os, sys, time, threading
 import numpy as np
 import pyvista as pv
+import vtk
+vtk.vtkObject.GlobalWarningDisplayOff()
 from scipy.ndimage import zoom as nd_zoom
-
-# ── PATHS ─────────────────────────────────────────────────────────────────────
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -18,34 +18,15 @@ TB_CENTER_PATH = os.path.join(BASE_DIR, "outputs", "tb_center.npy")
 GRADCAM_PATH   = os.path.join(BASE_DIR, "outputs", "gradcam.npy")
 VIDEO_PATH     = os.path.join(BASE_DIR, "outputs", "lung_rotation.mp4")
 
-# ── NEW: additional output paths for single-command generation ──────────────
 DIAGRAM_PATH   = os.path.join(BASE_DIR, "outputs", "lung_annotated_diagram.png")
 VERIFY_PATH    = os.path.join(BASE_DIR, "outputs", "coord_verification.png")
 os.makedirs(os.path.join(BASE_DIR, "outputs"), exist_ok=True)
 
-# ── ANATOMY TARGETS — Average Indian Adult Lungs ──────────────────────────────
-# Source: Indian Journal of Radiology, CT volumetry studies on Indian adults
-#
-#   Right lung: 3 lobes, wider (pushed by heart leftward), no cardiac notch
-#     Width (mediolateral) : ~95 mm
-#     Height (craniocaudal): ~220 mm
-#     Depth (A-P)          : ~130 mm
-#
-#   Left lung: 2 lobes, cardiac notch indents lower-medial border
-#     Width (mediolateral) : ~85 mm
-#     Height (craniocaudal): ~210 mm
-#     Depth (A-P)          : ~120 mm
-#
-# Scale each axis independently TO these targets so both lungs match real
-# Indian anatomy exactly — shape is preserved by the STL smoothing.
+R_W, R_H, R_D = 95.0, 220.0, 130.0
+L_W, L_H, L_D = 85.0, 210.0, 120.0
 
-R_W, R_H, R_D = 95.0, 220.0, 130.0   # right lung mm
-L_W, L_H, L_D = 85.0, 210.0, 120.0   # left lung mm
-
-PUSH_MM  = 14.0    # inward push at midline to close mediastinal gap
-TARGET_D = 125.0   # average A-P for depth calculations
-
-# ── AUDIO ─────────────────────────────────────────────────────────────────────
+PUSH_MM  = 14.0
+TARGET_D = 125.0
 
 def speak_async(text):
     def _speak():
@@ -57,26 +38,47 @@ def speak_async(text):
         os.system(f'espeak "{text}" 2>/dev/null')
     threading.Thread(target=_speak, daemon=True).start()
 
-# ── DETECT MESHES ─────────────────────────────────────────────────────────────
-
 USE_SPLIT = os.path.exists(LEFT_SHELL) and os.path.exists(RIGHT_SHELL)
 if not USE_SPLIT:
     print("[WARNING] Shell files not found — falling back to raw STL.")
     if not os.path.exists(LEFT_RAW) or not os.path.exists(RIGHT_RAW):
         print("[ERROR] No lung STL files found."); sys.exit(1)
 
-# ── LOAD TB HOTSPOT ───────────────────────────────────────────────────────────
+TB_CENTERS_PATH = os.path.join(BASE_DIR, "outputs", "tb_centers.npy")
 
-HAS_TB = os.path.exists(TB_CENTER_PATH)
-if HAS_TB:
+raw_regions = []  # list of dicts: {cx, cy, peak, mean, area_px}
+
+if os.path.exists(TB_CENTERS_PATH):
+    arr = np.load(TB_CENTERS_PATH)
+    for row in arr:
+        raw_regions.append({
+            "cx": float(row[0]), "cy": float(row[1]),
+            "peak": float(row[2]) if len(row) > 2 else 1.0,
+            "mean": float(row[3]) if len(row) > 3 else 1.0,
+            "area_px": int(row[4]) if len(row) > 4 else 0,
+        })
+    print(f"[INFO] Loaded {len(raw_regions)} infection region(s) from tb_centers.npy")
+elif os.path.exists(TB_CENTER_PATH):
     tb_raw = np.load(TB_CENTER_PATH)
-    cx, cy = int(tb_raw[0]), int(tb_raw[1])
-    print(f"[INFO] TB hotspot: cx={cx}  cy={cy}")
+    raw_regions.append({
+        "cx": float(tb_raw[0]), "cy": float(tb_raw[1]),
+        "peak": 1.0, "mean": 1.0, "area_px": 0,
+    })
+    print("[INFO] Loaded single legacy TB hotspot from tb_center.npy")
+
+raw_regions.sort(key=lambda r: r["peak"], reverse=True)
+HAS_TB = len(raw_regions) > 0
+
+if HAS_TB:
+    # cx, cy kept for anything downstream that still expects a single
+    # "primary" hotspot — this is the strongest region (highest peak).
+    cx, cy = int(round(raw_regions[0]["cx"])), int(round(raw_regions[0]["cy"]))
+    print(f"[INFO] Primary TB hotspot: cx={cx}  cy={cy}  "
+          f"({len(raw_regions)} region(s) total)")
 else:
     cx = cy = None
     print("[INFO] Healthy mode.")
 
-# ── HEATMAP ───────────────────────────────────────────────────────────────────
 
 HAS_GRADCAM = os.path.exists(GRADCAM_PATH)
 if HAS_GRADCAM:
@@ -95,8 +97,6 @@ elif HAS_TB:
 else:
     HEATMAP = np.zeros((224, 224), dtype=np.float32)
 
-# ── LOAD SHELL ────────────────────────────────────────────────────────────────
-
 def load_shell(path, side):
     mesh = pv.read(path)
     mesh = mesh.connectivity(extraction_mode='largest')
@@ -105,16 +105,12 @@ def load_shell(path, side):
     mesh = mesh.smooth(n_iter=300, relaxation_factor=0.04)
     mesh.compute_normals(inplace=True, auto_orient_normals=True)
 
-    # ── Indian adult lung targets ─────────────────────────────────────────────
     tw = R_W if side == 'right' else L_W
     th = R_H if side == 'right' else L_H
     td = R_D if side == 'right' else L_D
 
-    # Step 1 — uniform scale: fit the mesh so its LONGEST axis matches the
-    # corresponding target dimension. This avoids distorting the organic shape.
     b        = mesh.bounds
     raw_w    = b[1]-b[0]; raw_h = b[3]-b[2]; raw_d = b[5]-b[4]
-    # Pick the axis whose ratio is most constrained (smallest → avoids clipping)
     sf = min(tw/max(raw_w,1e-6), th/max(raw_h,1e-6), td/max(raw_d,1e-6))
     c  = np.array(mesh.center)
     pts = mesh.points.copy()
@@ -123,11 +119,9 @@ def load_shell(path, side):
     pts[:,2] = c[2] + (pts[:,2]-c[2]) * sf
     mesh.points = pts
 
-    # Centre in Y and Z
     b2 = mesh.bounds
     mesh.translate([0, -(b2[2]+b2[3])/2, -(b2[4]+b2[5])/2], inplace=True)
 
-    # Pin medial face to x=0 then push inward PUSH_MM to close gap
     b3 = mesh.bounds
     if side == 'left':
         mesh.translate([-b3[1] + PUSH_MM, 0, 0], inplace=True)
@@ -152,12 +146,6 @@ right_shell = load_shell(src_r, 'right')
 lb, rb = left_shell.bounds, right_shell.bounds
 print(f"[INFO] Gap at midline: {rb[0]-lb[1]:.1f} mm  "
       f"({'overlap=no gap' if rb[0]-lb[1]<0 else 'gap present'})")
-
-# ── BRONCHI ───────────────────────────────────────────────────────────────────
-# NOTE: trees are still loaded (used only for internal geometry bookkeeping)
-# but are no longer drawn in the 3-D viewer — see "add_tree(...)" calls
-# further down, which have been removed per request to drop the white
-# airway structure from both lungs' upper lobes.
 
 def load_tree(path, ref_shell):
     if not os.path.exists(path):
@@ -214,45 +202,136 @@ left_tree  = load_tree(LEFT_TREE,  left_shell)
 right_tree = load_tree(RIGHT_TREE, right_shell)
 print(f"[INFO] Trees: L={'OK' if left_tree else 'SKIP'}  R={'OK' if right_tree else 'SKIP'}")
 
-# ── PIVOT ─────────────────────────────────────────────────────────────────────
-
 PIVOT = np.array(left_shell.merge(right_shell).center)
 print(f"[INFO] Pivot: {[round(v,1) for v in PIVOT]}")
 
-# ── LOBE + LESION ─────────────────────────────────────────────────────────────
-
 lobe = "N/A"; lung_name = "N/A"; lesion_3d = None; target_lung = None
+regions_3d = []  # list of dicts: {lung, lung_name, lobe, lesion_3d, peak, mean, area_px, px}
+
+def _lung_medial_lateral_x(bounds):
+    """
+    Determine which side of a lung's x-bounds is medial (near the
+    shared midline at x=0, toward the mediastinum) vs lateral (far
+    from the midline, toward the outer chest wall). Done by comparing
+    absolute values rather than assuming xmin/xmax map to a fixed
+    side — this is geometry-agnostic, so it doesn't depend on which
+    way the raw STL happened to be oriented.
+    """
+    xmin, xmax = bounds[0], bounds[1]
+    if abs(xmax) < abs(xmin):
+        return xmax, xmin   # medial, lateral
+    return xmin, xmax        # medial, lateral
+
+
+def _pixel_x_to_mm(rcx, lung_name, bounds):
+    """
+    Map a 2D pixel column to an X position (mm) within the correct
+    lung — normalized to the HALF of the 224px image that actually
+    belongs to that lung (0-112 for RIGHT, 112-224 for LEFT), not the
+    full 0-224 range.
+
+    BUG THIS FIXES: the old formula did
+        lx = xmin + (rcx/224.0)*(xmax-xmin)
+    using the full image width as the denominator even though rcx was
+    already constrained to one half of it. For the LEFT lung, rcx only
+    ever ranges 112-224, so rcx/224.0 only ever produced 0.5-1.0 —
+    meaning every left-lung lesion was mathematically compressed into
+    only the medial (near-mediastinum) half of the lung; the lateral
+    half of the lung could never be reached, regardless of where the
+    real hotspot was in the 2D heatmap. Same issue for the right lung
+    mapping into the wrong half.
+    """
+    medial_x, lateral_x = _lung_medial_lateral_x(bounds)
+    if lung_name == "RIGHT":
+        frac_x = np.clip(rcx / 112.0, 0.0, 1.0)             # 0=lateral edge, 1=midline
+        return lateral_x + frac_x * (medial_x - lateral_x)
+    else:
+        frac_x = np.clip((rcx - 112.0) / 112.0, 0.0, 1.0)   # 0=midline, 1=lateral edge
+        return medial_x + frac_x * (lateral_x - medial_x)
+
+
+def _mm_x_to_pixel(lx, lung_name, bounds):
+    """Inverse of _pixel_x_to_mm — used by the coordinate-verification audit."""
+    medial_x, lateral_x = _lung_medial_lateral_x(bounds)
+    if lung_name == "RIGHT":
+        denom = medial_x - lateral_x
+        denom = denom if abs(denom) > 1e-9 else 1e-9
+        frac_x = (lx - lateral_x) / denom
+        return frac_x * 112.0
+    else:
+        denom = lateral_x - medial_x
+        denom = denom if abs(denom) > 1e-9 else 1e-9
+        frac_x = (lx - medial_x) / denom
+        return 112.0 + frac_x * 112.0
+
+
+def _classify_region(rcx, rcy):
+    """Given one region's 2D pixel coords, determine its lung, lobe, and 3D position."""
+    if rcx < 112: t_lung, l_name = right_shell, "RIGHT"
+    else:         t_lung, l_name = left_shell,  "LEFT"
+
+    xmin,xmax,ymin,ymax,zmin,zmax = t_lung.bounds
+    lx = _pixel_x_to_mm(rcx, l_name, t_lung.bounds)
+
+    # FIX: cy (image row from the 2D heatmap) must drive the VERTICAL axis
+    # (Y = apex-to-base), since Y is what's actually rendered as up/down on
+    # screen (rotate_y, camera up=(0,1,0)). It was previously routed into Z
+    # (depth) while Y was hardcoded to the lung midpoint, so the 3D marker
+    # never moved vertically no matter where the heatmap hotspot actually was.
+    ly = ymax - (rcy/224.0)*(ymax-ymin)   # small cy (top of image) -> high Y (apex)
+
+    # Depth (Z) is fixed at mid-depth — a single 2D X-ray has no real depth
+    # data to place a lesion front-to-back, so this doesn't pretend otherwise.
+    lz = (zmin + zmax) / 2.0
+
+    l3d = np.array([float(lx), float(ly), float(lz)], dtype=np.float64)
+
+    # Lobe classification now uses the SAME axis (Y) that actually moves the
+    # marker, so the label and the dot's position always agree with each other.
+    y_pct = (ly-ymin)/max(ymax-ymin,1e-9)
+    if l_name == "RIGHT":
+        lb_ = ("RIGHT UPPER LOBE"  if y_pct>0.66 else
+               "RIGHT MIDDLE LOBE" if y_pct>0.33 else "RIGHT LOWER LOBE")
+    else:
+        lb_ = "LEFT UPPER LOBE" if y_pct>0.50 else "LEFT LOWER LOBE"
+
+    return t_lung, l_name, lb_, l3d
+
 
 if HAS_TB:
-    if cx < 112: target_lung = right_shell; lung_name = "RIGHT"
-    else:        target_lung = left_shell;  lung_name = "LEFT"
+    for r in raw_regions:
+        t_lung, l_name, lb_, l3d = _classify_region(r["cx"], r["cy"])
+        regions_3d.append({
+            "lung": t_lung, "lung_name": l_name, "lobe": lb_,
+            "lesion_3d": l3d, "peak": r["peak"], "mean": r["mean"],
+            "area_px": r["area_px"], "px": (r["cx"], r["cy"]),
+        })
 
-    xmin,xmax,ymin,ymax,zmin,zmax = target_lung.bounds
-    lx = xmin + (cx/224.0)*(xmax-xmin)
-    lz = zmax - (cy/224.0)*(zmax-zmin)
-    ly = (ymin+ymax)/2.0
-    lesion_3d = np.array([float(lx), float(ly), float(lz)], dtype=np.float64)
+    # "Primary" region = strongest peak (raw_regions is already sorted,
+    # so regions_3d[0] is it). Everything below that historically used
+    # a single target_lung/lung_name/lobe/lesion_3d keeps working
+    # unchanged, now driven by the primary region.
+    target_lung = regions_3d[0]["lung"]
+    lung_name   = regions_3d[0]["lung_name"]
+    lobe        = regions_3d[0]["lobe"]
+    lesion_3d   = regions_3d[0]["lesion_3d"]
 
-    z_pct = (lz-zmin)/max(zmax-zmin,1e-9)
-    if lung_name == "RIGHT":
-        lobe = ("RIGHT UPPER LOBE"  if z_pct>0.66 else
-                "RIGHT MIDDLE LOBE" if z_pct>0.33 else "RIGHT LOWER LOBE")
-    else:
-        lobe = "LEFT UPPER LOBE" if z_pct>0.50 else "LEFT LOWER LOBE"
+    print(f"[INFO] {len(regions_3d)} region(s) classified:")
+    for i, rg in enumerate(regions_3d):
+        tag = " (PRIMARY)" if i == 0 else ""
+        print(f"  [{i+1}] {rg['lung_name']} | {rg['lobe']}{tag} | "
+              f"3D=({rg['lesion_3d'][0]:.1f},{rg['lesion_3d'][1]:.1f},{rg['lesion_3d'][2]:.1f})mm "
+              f"peak={rg['peak']:.2f} area={rg['area_px']}px")
 
-    print(f"[INFO] {lung_name} | {lobe}")
-    print(f"[INFO] Lesion 3D: x={lx:.1f}  y={ly:.1f}  z={lz:.1f} mm")
-
-# ── DEPTH — computed ONCE from initial (pre-rotation) bounds ──────────────────
 INITIAL_LUNG_BOUNDS = tuple(float(v) for v in target_lung.bounds) if target_lung is not None else None
 INITIAL_LESION_3D   = tuple(float(v) for v in lesion_3d)          if lesion_3d   is not None else None
 
 if HAS_TB and lesion_3d is not None and target_lung is not None:
     _b = INITIAL_LUNG_BOUNDS
 
-    ANT_Z    = _b[4]   # min-Z  = anterior surface
-    POST_Z   = _b[5]   # max-Z  = posterior surface
-    LUNG_AP  = POST_Z - ANT_Z           # total anterior-posterior depth
+    ANT_Z    = _b[4]
+    POST_Z   = _b[5]
+    LUNG_AP  = POST_Z - ANT_Z
 
     DEPTH_FROM_ANT_MM  = lesion_3d[2] - ANT_Z
     DEPTH_FROM_POST_MM = POST_Z - lesion_3d[2]
@@ -301,33 +380,45 @@ def log_depth_report(angle_int):
     print(f"  | {'Distance from carina':<22s}  {DIST_FROM_CARINA:7.1f} mm{' '*20}|")
     print(f"  +{'-'*W}+")
 
-# ── 3-D HEAT BLOB ─────────────────────────────────────────────────────────────
-
-def make_3d_heat(mesh, lesion_centre, heatmap_2d):
+def make_3d_heat_multi(mesh, regions_for_this_lung):
+    """
+    Sum (max-combine) Gaussian heat blobs for ALL infection regions
+    belonging to this lung mesh — replaces the old single-blob version
+    so multiple hot regions in the same lung (or across both lungs)
+    are each rendered distinctly instead of only the strongest one
+    surviving.
+    """
     pts = mesh.points
-    if lesion_centre is None:
-        return np.zeros(len(pts), dtype=np.float32)
+    total = np.zeros(len(pts), dtype=np.float32)
+    if not regions_for_this_lung:
+        return total
     xmin,xmax = mesh.bounds[0], mesh.bounds[1]
-    active   = (heatmap_2d > 0.5).sum()
-    sigma_xz = np.clip(np.sqrt(max(active,1)/np.pi)*(xmax-xmin)/224.0, 6.0, 22.0)
-    sigma_y  = np.clip(sigma_xz*0.55, 4.0, 14.0)
-    lx,ly,lz = lesion_centre
-    dx=pts[:,0]-lx; dy=pts[:,1]-ly; dz=pts[:,2]-lz
-    h = np.exp(-(dx**2/(2*sigma_xz**2) +
-                 dy**2/(2*sigma_y**2)  +
-                 dz**2/(2*sigma_xz**2))).astype(np.float32)
-    print(f"[INFO] Heat blob sigma_xz={sigma_xz:.1f}mm  sigma_y={sigma_y:.1f}mm  peak={h.max():.3f}")
-    return h
+    for rg in regions_for_this_lung:
+        # Size THIS region's own blob by its own detected pixel area,
+        # not the whole heatmap's active-pixel count as before — so a
+        # small secondary region doesn't get sized as if it were the
+        # large primary one.
+        area_px = max(rg["area_px"], 20)
+        sigma_xz = np.clip(np.sqrt(area_px/np.pi)*(xmax-xmin)/224.0, 10.0, 28.0)
+        sigma_y  = np.clip(sigma_xz*0.55, 7.0, 18.0)
+        lx,ly,lz = rg["lesion_3d"]
+        dx=pts[:,0]-lx; dy=pts[:,1]-ly; dz=pts[:,2]-lz
+        h = np.exp(-(dx**2/(2*sigma_xz**2) +
+                     dy**2/(2*sigma_y**2)  +
+                     dz**2/(2*sigma_xz**2))).astype(np.float32)
+        h = np.clip(h, 0.0, 1.0) ** 0.5
+        h *= rg["peak"]   # weight by this region's own activation strength
+        total = np.maximum(total, h)   # max-combine so overlapping blobs don't oversaturate
+        print(f"[INFO] Heat blob ({rg['lung_name']} {rg['lobe']}) "
+              f"sigma_xz={sigma_xz:.1f}mm  sigma_y={sigma_y:.1f}mm  peak={h.max():.3f}")
+    return total
 
-if HAS_TB and lung_name=="RIGHT":
-    right_shell["heat"] = make_3d_heat(right_shell, lesion_3d, HEATMAP)
-    left_shell["heat"]  = np.zeros(left_shell.n_points,  dtype=np.float32)
-elif HAS_TB and lung_name=="LEFT":
-    left_shell["heat"]  = make_3d_heat(left_shell,  lesion_3d, HEATMAP)
-    right_shell["heat"] = np.zeros(right_shell.n_points, dtype=np.float32)
-else:
-    left_shell["heat"]  = np.zeros(left_shell.n_points,  dtype=np.float32)
-    right_shell["heat"] = np.zeros(right_shell.n_points, dtype=np.float32)
+left_regions  = [rg for rg in regions_3d if rg["lung_name"] == "LEFT"]
+right_regions = [rg for rg in regions_3d if rg["lung_name"] == "RIGHT"]
+
+left_shell["heat"]  = make_3d_heat_multi(left_shell,  left_regions)
+right_shell["heat"] = make_3d_heat_multi(right_shell, right_regions)
+
 
 def generate_coord_verification():
     print("[INFO] Generating coordinate verification diagram ...")
@@ -345,30 +436,50 @@ def generate_coord_verification():
         ax1.set_facecolor("#0d0d0d")
         im = ax1.imshow(HEATMAP, cmap="jet", vmin=0, vmax=1,
                         extent=[0,224,224,0], alpha=0.85)
-        bpx = bpy = err_x = err_y = 0
-        if HAS_TB:
-            ax1.plot(cx, cy, "w+", markersize=22, markeredgewidth=2.5, zorder=10,
-                     label=f"tb_center ({cx},{cy})")
-            ax1.add_patch(mpatches.Circle((cx,cy),12,color="white",
-                          fill=False,linewidth=2,zorder=10))
-            if lesion_3d is not None:
-                xmin_,xmax_,_,_,zmin_,zmax_ = INITIAL_LUNG_BOUNDS
-                bpx=(lesion_3d[0]-xmin_)/max(xmax_-xmin_,1e-9)*223
-                bpy=(zmax_-lesion_3d[2])/max(zmax_-zmin_,1e-9)*223
-                ax1.plot(bpx,bpy,"*",color="yellow",markersize=14,
-                         markeredgecolor="white",zorder=12,
-                         label=f"Back-proj ({bpx:.0f},{bpy:.0f})")
-                err_x=abs(bpx-cx); err_y=abs(bpy-cy)
+
+        # Mark and back-project EVERY detected region, not just the
+        # primary one — a distinct color per region so this diagram
+        # stays consistent with what the 3D viewer actually shows.
+        REGION_COLORS = ["white", "#FF8800", "#00CCFF", "#00FF88", "#FF44FF"]
+        region_audit = []  # (region_idx, cx, cy, bpx, bpy, err_x, err_y)
+
+        if HAS_TB and regions_3d:
+            xmin_,xmax_,_,_,zmin_,zmax_ = INITIAL_LUNG_BOUNDS
+            for i, rg in enumerate(regions_3d):
+                col = REGION_COLORS[i % len(REGION_COLORS)]
+                rcx, rcy = rg["px"]
+                is_primary = (i == 0)
+                marker_size = 22 if is_primary else 16
+
+                ax1.plot(rcx, rcy, "+", color=col, markersize=marker_size,
+                          markeredgewidth=2.5 if is_primary else 1.8, zorder=10,
+                          label=f"Region {i+1} ({rcx:.0f},{rcy:.0f})")
+                ax1.add_patch(mpatches.Circle((rcx,rcy), 12 if is_primary else 9,
+                              color=col, fill=False,
+                              linewidth=2 if is_primary else 1.4, zorder=10))
+
+                # Back-project this region's own 3D position, using its
+                # own lung's bounds (regions can be in different lungs)
+                # and the CORRECT inverse of the fixed forward mapping.
+                r_lung = rg["lung"]
+                rxmin_,rxmax_,_,_,rzmin_,rzmax_ = r_lung.bounds
+                bpx = _mm_x_to_pixel(rg["lesion_3d"][0], rg["lung_name"], r_lung.bounds)
+                bpy = (rzmax_-rg["lesion_3d"][2])/max(rzmax_-rzmin_,1e-9)*223
+                ax1.plot(bpx, bpy, "*", color=col,
+                          markersize=13 if is_primary else 10,
+                          markeredgecolor="white", zorder=12)
+                err_x = abs(bpx-rcx); err_y = abs(bpy-rcy)
+                region_audit.append((i, rcx, rcy, bpx, bpy, err_x, err_y, rg))
 
         ax1.set_xlim(0,224); ax1.set_ylim(224,0)
         ax1.set_xlabel("Image column (px)",color="white",fontsize=11)
         ax1.set_ylabel("Image row (px)",color="white",fontsize=11)
         ax1.tick_params(colors="white")
         for sp in ax1.spines.values(): sp.set_edgecolor("white")
-        ax1.set_title("2-D GradCAM Heatmap — Coordinate Markers",
+        ax1.set_title("2-D GradCAM Heatmap — Coordinate Markers (all regions)",
                       color="white",fontsize=13,fontweight="bold")
-        if HAS_TB:
-            ax1.legend(loc="lower right",fontsize=9,
+        if HAS_TB and regions_3d:
+            ax1.legend(loc="lower right",fontsize=8,
                        facecolor="#1a1a1a",edgecolor="white",labelcolor="white")
         plt.colorbar(im,ax=ax1,fraction=0.035,pad=0.02,
                      label="GradCAM activation").ax.yaxis.label.set_color("white")
@@ -387,46 +498,52 @@ def generate_coord_verification():
             ("","","",""),
             ("Source","Col/X","Row/Z","Status"),
         ]
-        if HAS_TB and lesion_3d is not None:
-            pass_fail = "PASS" if err_x<1 and err_y<1 else "CHECK"
+
+        all_pass = True
+        if HAS_TB and region_audit:
+            for i, rcx, rcy, bpx, bpy, err_x, err_y, rg in region_audit:
+                pass_fail = "PASS" if err_x<1 and err_y<1 else "CHECK"
+                if pass_fail != "PASS":
+                    all_pass = False
+                tag = " (PRI)" if i == 0 else f" ({i+1})"
+                lines += [
+                    (f"Region{tag} px", f"{rcx:.0f}", f"{rcy:.0f}", "INPUT"),
+                    (f"  Back-proj px", f"{bpx:.1f}", f"{bpy:.1f}", pass_fail),
+                    (f"  3D lesion (mm)", f"{rg['lesion_3d'][0]:.1f}", f"{rg['lesion_3d'][2]:.1f}", "MAPPED"),
+                    (f"  Lung / Lobe", rg["lung_name"], rg["lobe"][:12], ""),
+                    ("","","",""),
+                ]
             lines += [
-                (f"tb_center.npy (px)",f"{cx}",f"{cy}","INPUT"),
-                (f"Back-projected (px)",f"{bpx:.1f}",f"{bpy:.1f}",pass_fail),
-                ("","","",""),
-                ("3-D lesion (mm)",f"{lesion_3d[0]:.1f}",f"{lesion_3d[2]:.1f}","MAPPED"),
-                (f"Lung",lung_name,"",""),
-                (f"Lobe",lobe,"",""),
-                (f"Depth (ant)",f"{DEPTH_FROM_ANT_MM:.1f}mm",
-                 f"{DEPTH_PCT:.0f}%","from front"),
-                (f"Carina dist",f"{DIST_FROM_CARINA:.1f}mm","",""),
+                (f"Carina dist (primary)", f"{DIST_FROM_CARINA:.1f}mm", "", ""),
             ]
 
-        colours=["#AAAAFF","#CCCCFF","#88FFAA","#6699FF","white",
-                 "#AAAAFF","white","#FFFF00","white","#FF8844",
-                 "#FF8844","#FFAA44","#FFAA44"]
-        y_pos=0.88
+        colours=["#AAAAFF","#CCCCFF","#88FFAA","#6699FF","white","#AAAAFF"]
+        y_pos=0.86
         for i,row in enumerate(lines):
             col = colours[i] if i < len(colours) else "white"
-            ax2.text(0.02,y_pos,row[0],color=col,fontsize=9,
+            fs = 9 if i < 6 else 8
+            ax2.text(0.02,y_pos,row[0],color=col,fontsize=fs,
                      fontfamily="monospace",transform=ax2.transAxes)
-            ax2.text(0.42,y_pos,row[1],color=col,fontsize=9,
+            ax2.text(0.46,y_pos,row[1],color=col,fontsize=fs,
                      fontfamily="monospace",ha="center",transform=ax2.transAxes)
-            ax2.text(0.65,y_pos,row[2],color=col,fontsize=9,
+            ax2.text(0.70,y_pos,row[2],color=col,fontsize=fs,
                      fontfamily="monospace",ha="center",transform=ax2.transAxes)
-            ax2.text(0.98,y_pos,row[3],color=col,fontsize=9,
+            ax2.text(0.98,y_pos,row[3],color=col,fontsize=fs,
                      fontfamily="monospace",ha="right",transform=ax2.transAxes)
-            y_pos -= 0.072
+            y_pos -= 0.052
 
-        verdict = ("COORDINATES VERIFIED -- 2D pixel matches 3D position"
-                   if HAS_TB and err_x<1 and err_y<1
-                   else "Healthy scan -- no coordinates to verify")
-        vcol = "#00FF88" if HAS_TB and err_x<1 and err_y<1 else "#888888"
+        n_regions = len(regions_3d) if HAS_TB else 0
+        verdict = (f"ALL {n_regions} REGION(S) VERIFIED -- 2D pixels match 3D positions"
+                   if HAS_TB and all_pass
+                   else (f"CHECK: {n_regions} region(s), some mismatched"
+                         if HAS_TB else "Healthy scan -- no coordinates to verify"))
+        vcol = "#00FF88" if HAS_TB and all_pass else ("#FFAA00" if HAS_TB else "#888888")
         ax2.text(0.5,0.02,verdict,color=vcol,fontsize=10,
                  fontweight="bold",ha="center",va="bottom",transform=ax2.transAxes,
                  bbox=dict(boxstyle="round,pad=0.4",facecolor="#111111",
                            edgecolor=vcol,linewidth=1.5))
 
-        title = (f"TB Coord Verification | Lung:{lung_name} | "
+        title = (f"TB Coord Verification | {n_regions} region(s) | Primary: {lung_name} "
                  f"Pixel:({cx},{cy}) -> 3D:({lesion_3d[0]:.0f},{lesion_3d[1]:.0f},{lesion_3d[2]:.0f})mm"
                  if HAS_TB and lesion_3d is not None else "Coord Verification — Healthy scan")
         fig.suptitle(title,color="white",fontsize=11,y=0.99)
@@ -501,29 +618,44 @@ def generate_lung_diagram():
         ax.fill_between(dx,dy-22,dy,color="#1A3A4A",alpha=0.45,zorder=2)
 
         for hx,hy in [(L_CX+10,BASE_Y+68),(R_CX-10,BASE_Y+68)]:
-            hx, hy = float(hx), float(hy)   # guard against non-finite/VTK-wrapped values
+            hx, hy = float(hx), float(hy)
             if not (np.isfinite(hx) and np.isfinite(hy)):
                 continue
             ax.add_patch(Ellipse((hx,hy),14,24,color="#2A6A8A",alpha=0.7,zorder=4))
             ax.add_patch(Ellipse((hx,hy),14,24,fill=False,
                                  edgecolor="#7ACCE0",linewidth=1.5,zorder=5))
 
-        ldx = ldy = 0
-        if HAS_TB and lesion_3d is not None and INITIAL_LUNG_BOUNDS is not None:
-            xmin_,xmax_,_,_,zmin_,zmax_ = INITIAL_LUNG_BOUNDS
-            tw = R_W if lung_name=="RIGHT" else L_W
-            if lung_name=="LEFT":
-                ldx=L_CX+(lesion_3d[0]-(xmin_+xmax_)/2)/(tw/2)*HW*0.82
-            else:
-                ldx=R_CX+(lesion_3d[0]-(xmin_+xmax_)/2)/(tw/2)*HW*0.82
-            ldy=BASE_Y+(lesion_3d[2]-zmin_)/(zmax_-zmin_)*(TOP_Y-BASE_Y)
+        region_diagram_pts = []  # (region_idx, ldx, ldy, rg) for later annotation
+        if HAS_TB and regions_3d and INITIAL_LUNG_BOUNDS is not None:
+            for i, rg in enumerate(regions_3d):
+                r_l3d = rg["lesion_3d"]
+                r_lung_bounds = rg["lung"].bounds
+                rxmin_,rxmax_,_,_,rzmin_,rzmax_ = r_lung_bounds
+                tw = R_W if rg["lung_name"]=="RIGHT" else L_W
+                r_cx_diag = R_CX if rg["lung_name"]=="RIGHT" else L_CX
+                r_ldx = r_cx_diag + (r_l3d[0]-(rxmin_+rxmax_)/2)/(tw/2)*HW*0.82
+                r_ldy = BASE_Y + (r_l3d[2]-rzmin_)/(rzmax_-rzmin_)*(TOP_Y-BASE_Y)
 
-            for r,col,alp in [(30,"#0000FF",0.10),(24,"#00CCFF",0.14),
-                               (18,"#00FF88",0.18),(13,"#FFFF00",0.32),
-                               (8, "#FF6600",0.55),(5, "#FF0000",0.88)]:
-                ax.add_patch(plt.Circle((ldx,ldy),r,color=col,alpha=alp,zorder=8))
-            ax.add_patch(plt.Circle((ldx,ldy),5,fill=False,
-                                    edgecolor="#FF2200",linewidth=2.2,zorder=9))
+                is_primary = (i == 0)
+                # Secondary regions get a slightly smaller/dimmer stack so
+                # the primary region still reads as the main finding.
+                rings = ([(30,"#0000FF",0.10),(24,"#00CCFF",0.14),
+                          (18,"#00FF88",0.18),(13,"#FFFF00",0.32),
+                          (8, "#FF6600",0.55),(5, "#FF0000",0.88)]
+                         if is_primary else
+                         [(22,"#0000FF",0.08),(17,"#00CCFF",0.11),
+                          (13,"#FFCC00",0.24),(6, "#FF8800",0.60)])
+                edge_col = "#FF2200" if is_primary else "#FFAA00"
+
+                for r,col,alp in rings:
+                    ax.add_patch(plt.Circle((r_ldx,r_ldy),r,color=col,alpha=alp,zorder=8))
+                ax.add_patch(plt.Circle((r_ldx,r_ldy), 5 if is_primary else 3.5, fill=False,
+                                        edgecolor=edge_col,linewidth=2.2 if is_primary else 1.6,zorder=9))
+
+                region_diagram_pts.append((i, r_ldx, r_ldy, rg))
+
+        # Kept for compatibility with anything below expecting a single point
+        ldx, ldy = (region_diagram_pts[0][1], region_diagram_pts[0][2]) if region_diagram_pts else (0, 0)
 
         def ann(text, xy, xytext, color="#DDDDDD", fs=9, ac="#AAAAAA"):
             ax.annotate(text,xy=xy,xytext=xytext,
@@ -565,22 +697,27 @@ def generate_lung_diagram():
         ann(f"TRACHEA",(0,TOP_Y+16),(45,TOP_Y+50),color="#C8E8F8")
         ann(f"DIAPHRAGM",(0,BASE_Y-8),(0,BASE_Y-32),color="#5AAAB8")
 
-        if HAS_TB and lesion_3d is not None:
-            inf_txt=(f"TB INFECTION\n"
-                     f"Lung  : {lung_name}\n"
-                     f"Lobe  : {lobe}\n"
-                     f"3D    : ({lesion_3d[0]:.0f},{lesion_3d[1]:.0f},{lesion_3d[2]:.0f})mm\n"
-                     f"Pixel : ({cx},{cy}) / 224x224\n"
-                     f"Depth : {DEPTH_FROM_ANT_MM:.0f}mm ({DEPTH_PCT:.0f}%)\n"
-                     f"Carina: {DIST_FROM_CARINA:.0f}mm")
-            xt = L_CX-105 if lung_name=="LEFT" else R_CX+105
-            ax.annotate(inf_txt,xy=(ldx,ldy),xytext=(xt,ldy-20),
-                fontsize=9,color="#FFDD00",fontfamily='monospace',
-                ha='center',va='center',zorder=20,
-                bbox=dict(boxstyle='round,pad=0.5',facecolor='#180808',
-                          edgecolor='#FF4400',linewidth=2,alpha=0.96),
-                arrowprops=dict(arrowstyle='->',color='#FF4400',
-                                lw=2.2,connectionstyle='arc3,rad=0.22'))
+        if HAS_TB and region_diagram_pts:
+            for i, r_ldx, r_ldy, rg in region_diagram_pts:
+                is_primary = (i == 0)
+                tag = " (PRIMARY)" if is_primary and len(region_diagram_pts) > 1 else ""
+                inf_txt=(f"TB INFECTION{tag if is_primary else f' — REGION {i+1}'}\n"
+                         f"Lung  : {rg['lung_name']}\n"
+                         f"Lobe  : {rg['lobe']}\n"
+                         f"3D    : ({rg['lesion_3d'][0]:.0f},{rg['lesion_3d'][1]:.0f},{rg['lesion_3d'][2]:.0f})mm\n"
+                         f"Pixel : ({rg['px'][0]:.0f},{rg['px'][1]:.0f}) / 224x224\n"
+                         f"Peak  : {rg['peak']:.2f}")
+                xt = (L_CX-105 if rg["lung_name"]=="LEFT" else R_CX+105)
+                yt = r_ldy - 20 - (0 if is_primary else 55)  # stack secondary labels lower to avoid overlap
+                txt_col = "#FFDD00" if is_primary else "#FFB84D"
+                edge_col = "#FF4400" if is_primary else "#FF9900"
+                ax.annotate(inf_txt,xy=(r_ldx,r_ldy),xytext=(xt,yt),
+                    fontsize=9 if is_primary else 8,color=txt_col,fontfamily='monospace',
+                    ha='center',va='center',zorder=20,
+                    bbox=dict(boxstyle='round,pad=0.5',facecolor='#180808',
+                              edgecolor=edge_col,linewidth=2 if is_primary else 1.4,alpha=0.96),
+                    arrowprops=dict(arrowstyle='->',color=edge_col,
+                                    lw=2.2 if is_primary else 1.6,connectionstyle='arc3,rad=0.22'))
 
         ox,oy=138,-112
         ax.add_patch(FancyBboxPatch((ox-55,oy-30),110,68,
@@ -638,14 +775,10 @@ print(f"[INFO] Saved: outputs/{os.path.basename(VERIFY_PATH)}")
 print(f"[INFO] Saved: outputs/{os.path.basename(DIAGRAM_PATH)}")
 print("[INFO] Opening 3-D viewer ...\n")
 
-# ── PLOTTER ───────────────────────────────────────────────────────────────────
-
 plotter = pv.Plotter(window_size=[1600, 900])
-plotter.enable_trackball_style()     # left-drag=rotate, scroll=zoom, right-drag=pan
+plotter.enable_trackball_style()
 plotter.set_background("#06080D")
 plotter.enable_anti_aliasing("ssaa")
-
-# ── ZOOM FIX ──────────────────────────────────────────────────────────────────
 
 CLIP_NEAR, CLIP_FAR = 0.01, 50000
 
@@ -718,45 +851,110 @@ def add_tree(tree):
         smooth_shading=True, specular=0.50, specular_power=22,
         ambient=0.20, diffuse=0.80, lighting=True)
 
-# add_tree(left_tree)     # removed — white bronchi structure
-# add_tree(right_tree)    # removed — white bronchi structure
-
 def add_lesion(mesh):
+    # Steeper opacity ramp: mid-range activation becomes solidly opaque
+    # much sooner, so the red/yellow core is clearly visible instead of
+    # staying translucent until scalar values approach 1.0.
     opac = [
-        0.00, 0.00, 0.00, 0.00,
-        0.10, 0.35, 0.62, 0.80,
-        0.90, 0.96, 0.99,
+        0.00, 0.00, 0.05, 0.25,
+        0.55, 0.78, 0.90, 0.96,
+        0.99, 1.00, 1.00,
     ]
     plotter.add_mesh(mesh, scalars="heat", cmap="jet",
         clim=[0.0,1.0], opacity=opac,
         smooth_shading=True, show_scalar_bar=False,
         specular=0.55, specular_power=18, ambient=0.18)
 
-if HAS_TB and lung_name=="RIGHT": add_lesion(right_shell)
-elif HAS_TB and lung_name=="LEFT": add_lesion(left_shell)
-
-def add_fixed_lesion_marker():
-    if not HAS_TB or INITIAL_LESION_3D is None:
+def add_lesion_glow(lesion_centre):
+    """Soft outer glow behind the hotspot — purely visual, makes the
+    infection site pop at a glance instead of relying only on the
+    gradient's own falloff."""
+    if lesion_centre is None:
         return
-    pt = np.array(INITIAL_LESION_3D)
+    for radius, color, opacity in [
+        (26, "#FF3300", 0.05),
+        (18, "#FF5500", 0.10),
+        (11, "#FF8800", 0.18),
+    ]:
+        glow = pv.Sphere(radius=radius, center=lesion_centre)
+        plotter.add_mesh(glow, color=color, opacity=opacity,
+                          lighting=False, smooth_shading=True)
 
-    plotter.add_mesh(pv.Sphere(radius=2.4, center=pt),
-                      color="#FF0000", opacity=0.95, lighting=False)
+if HAS_TB:
+    if right_regions:
+        add_lesion(right_shell)
+        for rg in right_regions:
+            add_lesion_glow(rg["lesion_3d"])
+    if left_regions:
+        add_lesion(left_shell)
+        for rg in left_regions:
+            add_lesion_glow(rg["lesion_3d"])
 
-    axis_len = 18
-    for d in (np.array([axis_len,0,0]), np.array([0,axis_len,0]), np.array([0,0,axis_len])):
-        line = pv.Line(pt - d, pt + d)
-        plotter.add_mesh(line, color="#FFFFFF", line_width=1.5, opacity=0.55)
+def add_fixed_lesion_markers():
+    """
+    One fixed coordinate marker per detected infection region — the
+    primary (strongest) region gets a larger red marker matching the
+    old single-marker look; any additional regions get a smaller
+    orange marker so multiple infection sites are all visible and
+    distinguishable at a glance.
 
-    # FONT SIZE UPDATE: 15 -> 22, bold kept True, margin/shape opacity bumped
-    plotter.add_point_labels(
-        [pt], [f"FIXED COORD\n({pt[0]:.1f}, {pt[1]:.1f}, {pt[2]:.1f}) mm"],
-        font_size=22, text_color="#FFFFFF", bold=True,
-        shape_color="#3A0000", shape_opacity=0.90,
-        margin=10, show_points=False, always_visible=True, shadow=True,
-    )
+    Labels are offset OUTWARD from each marker (with a thin leader
+    line) rather than placed directly at the point — when two regions
+    are close together (e.g. both near the mediastinum), placing
+    labels right at the marker causes the text boxes to overlap and
+    become unreadable, which is exactly what happened before this fix.
+    """
+    if not HAS_TB or not regions_3d:
+        return
+    for i, rg in enumerate(regions_3d):
+        pt = np.array(rg["lesion_3d"])
+        is_primary = (i == 0)
+        color  = "#FF0000" if is_primary else "#FF8800"
+        radius = 2.4 if is_primary else 1.8
 
-add_fixed_lesion_marker()
+        plotter.add_mesh(pv.Sphere(radius=radius, center=pt),
+                          color=color, opacity=0.95, lighting=False)
+
+        axis_len = 18 if is_primary else 12
+        for d in (np.array([axis_len,0,0]), np.array([0,axis_len,0]), np.array([0,0,axis_len])):
+            line = pv.Line(pt - d, pt + d)
+            plotter.add_mesh(line, color="#FFFFFF",
+                              line_width=1.5 if is_primary else 1.0,
+                              opacity=0.55 if is_primary else 0.40)
+
+        # Stagger label positions: primary stays near-center-high,
+        # each additional region is pushed further out and alternates
+        # up/down so labels don't stack on top of each other.
+        if is_primary:
+            offset = np.array([0.0, 45.0, 0.0])
+        else:
+            side = 1.0 if (i % 2 == 1) else -1.0
+            spread = 40.0 + 25.0 * ((i - 1) // 2)
+            vertical = -35.0 - 20.0 * ((i - 1) // 2)
+            offset = np.array([side * spread, vertical, 0.0])
+
+        label_pt = pt + offset
+
+        leader = pv.Line(pt, label_pt)
+        plotter.add_mesh(leader, color=color, line_width=1.2, opacity=0.5)
+
+        tag = " (PRIMARY)" if is_primary else ""
+        label = (f"REGION {i+1}{tag}\n"
+                 f"({pt[0]:.1f}, {pt[1]:.1f}, {pt[2]:.1f}) mm\n"
+                 f"{rg['lung_name']} | {rg['lobe']}\n"
+                 f"peak={rg['peak']:.2f}")
+
+        plotter.add_point_labels(
+            [label_pt], [label],
+            font_size=20 if is_primary else 15,
+            text_color="#FFFFFF", bold=True,
+            shape_color="#3A0000" if is_primary else "#2A1800",
+            shape_opacity=0.90 if is_primary else 0.82,
+            margin=10, show_points=False, always_visible=True, shadow=True,
+        )
+
+add_fixed_lesion_markers()
+
 
 plotter.add_scalar_bar(
     title="TB Activation (GradCAM++)", n_labels=5, fmt="%.1f",
@@ -764,7 +962,7 @@ plotter.add_scalar_bar(
     label_font_size=10, title_font_size=10, color="white")
 
 def add_anatomical_labels():
-    lb = left_shell.bounds   # xmin,xmax,ymin,ymax,zmin,zmax
+    lb = left_shell.bounds
     rb = right_shell.bounds
     mid_z = (min(lb[4],rb[4]) + max(lb[5],rb[5])) / 2
 
@@ -824,9 +1022,6 @@ def add_anatomical_labels():
         plotter.add_mesh(pv.Sphere(radius=1.6, center=a),
                           color="#7ACCE0", opacity=0.9)
 
-    # ── FONT SIZE UPDATE (this request): general anatomical labels ──────────
-    # font_size 17 -> 26, bold kept True, shape_opacity 0.85 -> 0.90,
-    # margin 9 -> 12 so the bigger text has breathing room inside its plate.
     plotter.add_point_labels(
         label_ends, texts,
         font_size=26, text_color="#CFEFFF", bold=True,
@@ -838,8 +1033,9 @@ def add_anatomical_labels():
     )
 
     if HAS_TB and lesion_3d is not None:
+        region_note = f" (PRIMARY — 1 of {len(regions_3d)} regions)" if len(regions_3d) > 1 else ""
         infection_text = (
-            f"TB INFECTION SITE\n"
+            f"TB INFECTION SITE{region_note}\n"
             f"Lung: {lung_name}   Lobe: {lobe}\n"
             f"3D coords: ({lesion_3d[0]:.1f}, {lesion_3d[1]:.1f}, {lesion_3d[2]:.1f}) mm\n"
             f"Pixel: ({cx},{cy})   Depth: {DEPTH_FROM_ANT_MM:.1f} mm ({DEPTH_PCT:.0f}%)\n"
@@ -853,9 +1049,6 @@ def add_anatomical_labels():
         plotter.add_mesh(pv.Sphere(radius=2.2, center=lesion_3d),
                           color="#FF2200", opacity=0.95)
 
-        # ── FONT SIZE UPDATE (this request): TB infection callout ───────────
-        # font_size 20 -> 30, bold kept True, shape_opacity 0.92 -> 0.95,
-        # margin 11 -> 14.
         plotter.add_point_labels(
             [tb_end], [infection_text],
             font_size=30, text_color="#FFE45C", bold=True,
@@ -871,11 +1064,15 @@ plotter.add_text("3-D ANALYSIS MODEL",
     position="upper_left", font_size=16, color="white")
 
 if HAS_TB and lesion_3d is not None:
+    region_line = (f"Regions    : {len(regions_3d)} detected\n\n"
+                   if len(regions_3d) > 1 else "")
+    primary_tag = " (PRIMARY)" if len(regions_3d) > 1 else ""
     info = (
         f"Prediction : TB Positive\n\n"
         f"Confidence : 100%\n\n"
-        f"Lung       : {lung_name}\n\n"
-        f"Lobe       : {lobe}\n\n"
+        f"{region_line}"
+        f"Lung{primary_tag}       : {lung_name}\n\n"
+        f"Lobe{primary_tag}       : {lobe}\n\n"
         f"Hotspot px : ({cx}, {cy})\n\n"
         f"Lesion 3D  : ({lesion_3d[0]:.0f}, {lesion_3d[1]:.0f}, {lesion_3d[2]:.0f}) mm\n\n"
         f"Ant. surf Z: {ANT_Z:.1f} mm\n\n"
@@ -891,7 +1088,7 @@ else:
 
 plotter.add_text(info, position="upper_right", font_size=13, color="white")
 plotter.add_text(
-    "RED = TB hotspot   YELLOW/GREEN = moderate activation",
+    "RED = primary region   ORANGE = additional region(s)   YELLOW/GREEN = moderate activation",
     position="lower_left", font_size=9, color="#666666")
 plotter.add_text(
     "F=Front  B=Back  L=Left  R=Right  Y=Rotate  V=Video  "

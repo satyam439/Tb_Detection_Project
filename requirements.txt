@@ -10,4 +10,4 @@ pyvista
 vtk
 plotly
 pandas
-pytorch-grad-cam
+grad-cam
